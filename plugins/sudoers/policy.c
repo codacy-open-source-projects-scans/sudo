@@ -466,18 +466,21 @@ sudoers_policy_deserialize_info(struct sudoers_context *ctx, void *v,
 	    continue;
 	}
 	if (MATCHES(*cur, "ttydev=")) {
-	    unsigned long long ullval;
-	    char *ep;
+	    long long llval;
 
+	    /*
+	     * dev_t can be signed or unsigned.  The front-end formats it
+	     * as long long (signed).  We allow the full range of values
+	     * which should work with either signed or unsigned dev_t.
+	     */
 	    p = *cur + sizeof("ttydev=") - 1;
-	    errno = 0;
-	    ullval = strtoull(p, &ep, 10);
-	    if ((*p == '\0' || *ep != '\0') ||
-		    (errno == ERANGE && ullval == ULLONG_MAX)) {
+	    llval = sudo_strtonum(p, LLONG_MIN, LLONG_MAX, &errstr);
+	    if (errstr != NULL) {
+		/* Front end bug?  Not a fatal error. */
 		INVALID("ttydev=");
-		goto bad;
+		continue;
 	    }
-	    ctx->user.ttydev = (dev_t)ullval;
+	    ctx->user.ttydev = (dev_t)llval;
 	    continue;
 	}
 	if (MATCHES(*cur, "host=")) {
