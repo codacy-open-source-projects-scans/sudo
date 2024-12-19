@@ -94,8 +94,10 @@
 
 #if defined(sudo_kp_tdev)
 /*
- * Store the name of the tty to which the process is attached in name.
- * Returns name on success and NULL on failure, setting errno.
+ * Look up terminal device that the process is attached to and
+ * fill in its name, if available.  Sets name to the empty string
+ * if the device number cannot be mapped to a device name.
+ * Returns the tty device number on success and -1 on failure, setting errno.
  */
 dev_t
 get_process_ttyname(char *name, size_t namelen)
@@ -103,7 +105,7 @@ get_process_ttyname(char *name, size_t namelen)
     struct sudo_kinfo_proc *ki_proc = NULL;
     size_t size = sizeof(*ki_proc);
     int mib[6], rc, serrno = errno;
-    dev_t ttydev = (dev_t)-1;
+    dev_t ttydev = NODEV;
     debug_decl(get_process_ttyname, SUDO_DEBUG_UTIL);
 
     /*
@@ -131,14 +133,15 @@ get_process_ttyname(char *name, size_t namelen)
     }
     errno = ENOENT;
     if (rc != -1) {
-	if ((dev_t)ki_proc->sudo_kp_tdev != (dev_t)-1) {
+	if ((dev_t)ki_proc->sudo_kp_tdev != NODEV) {
 	    errno = serrno;
 	    ttydev = (dev_t)ki_proc->sudo_kp_tdev;
 	    if (sudo_ttyname_dev(ttydev, name, namelen) == NULL) {
-		sudo_warnx(
-		    U_("unable to find terminal name for device %u, %u"),
+		sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+		    "unable to find terminal name for device %u, %u",
 		    (unsigned int)major(ttydev), (unsigned int)minor(ttydev));
-		ttydev = (dev_t)-1;
+		if (namelen != 0)
+		    *name = '\0';
 	    }
 	}
     } else {
@@ -151,13 +154,15 @@ get_process_ttyname(char *name, size_t namelen)
 }
 #elif defined(HAVE_STRUCT_PSINFO_PR_TTYDEV)
 /*
- * Store the name of the tty to which the process is attached in name.
- * Returns name on success and NULL on failure, setting errno.
+ * Look up terminal device that the process is attached to and
+ * fill in its name, if available.  Sets name to the empty string
+ * if the device number cannot be mapped to a device name.
+ * Returns the tty device number on success and -1 on failure, setting errno.
  */
 dev_t
 get_process_ttyname(char *name, size_t namelen)
 {
-    dev_t ttydev = (dev_t)-1;
+    dev_t ttydev = NODEV;
     struct psinfo psinfo;
     char path[PATH_MAX];
     ssize_t nread;
@@ -176,17 +181,18 @@ get_process_ttyname(char *name, size_t namelen)
 		ttydev = makedev(major64(psinfo.pr_ttydev), minor64(psinfo.pr_ttydev));
 #endif
 	    /* On AIX, pr_ttydev is 0 (not -1) when no terminal is present. */
-	    if (ttydev != 0 && ttydev != (dev_t)-1) {
+	    if (ttydev != 0 && ttydev != NODEV) {
 		errno = serrno;
 		if (sudo_ttyname_dev(ttydev, name, namelen) == NULL) {
-		    sudo_warnx(
-			U_("unable to find terminal name for device %u, %u"),
+		    sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+			"unable to find terminal name for device %u, %u",
 			(unsigned int)major(ttydev), (unsigned int)minor(ttydev));
-		    ttydev = (dev_t)-1;
+		    if (namelen != 0)
+			*name = '\0';
 		}
 		goto done;
 	    }
-	    ttydev = (dev_t)-1;
+	    ttydev = NODEV;
 	}
     } else {
 	struct stat sb;
@@ -197,10 +203,11 @@ get_process_ttyname(char *name, size_t namelen)
 	    if (sudo_isatty(i, &sb)) {
 		ttydev = sb.st_rdev;
 		if (sudo_ttyname_dev(ttydev, name, namelen) == NULL) {
-		    sudo_warnx(
-			U_("unable to find terminal name for device %u, %u"),
+		    sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+			"unable to find terminal name for device %u, %u",
 			(unsigned int)major(ttydev), (unsigned int)minor(ttydev));
-		    ttydev = (dev_t)-1;
+		    if (namelen != 0)
+			*name = '\0';
 		}
 		goto done;
 	    }
@@ -209,7 +216,7 @@ get_process_ttyname(char *name, size_t namelen)
     errno = ENOENT;
 
 done:
-    if (ttydev == (dev_t)-1)
+    if (ttydev == NODEV)
 	sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO|SUDO_DEBUG_ERRNO,
 	    "unable to resolve tty via %s", path);
 
@@ -217,14 +224,16 @@ done:
 }
 #elif defined(__linux__)
 /*
- * Store the name of the tty to which the process is attached in name.
- * Returns name on success and NULL on failure, setting errno.
+ * Look up terminal device that the process is attached to and
+ * fill in its name, if available.  Sets name to the empty string
+ * if the device number cannot be mapped to a device name.
+ * Returns the tty device number on success and -1 on failure, setting errno.
  */
 dev_t
 get_process_ttyname(char *name, size_t namelen)
 {
     const char path[] = "/proc/self/stat";
-    dev_t ttydev = (dev_t)-1;
+    dev_t ttydev = NODEV;
     char *cp, buf[1024];
     int serrno = errno;
     pid_t ppid = 0;
@@ -282,10 +291,11 @@ get_process_ttyname(char *name, size_t namelen)
 				ttydev = (unsigned int)tty_nr;
 				errno = serrno;
 				if (sudo_ttyname_dev(ttydev, name, namelen) == NULL) {
-				    sudo_warnx(
-					U_("unable to find terminal name for device %u, %u"),
+				    sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+					"unable to find terminal name for device %u, %u",
 					(unsigned int)major(ttydev), (unsigned int)minor(ttydev));
-				    ttydev = (dev_t)-1;
+				    if (namelen != 0)
+					*name = '\0';
 				}
 				goto done;
 			    }
@@ -310,10 +320,11 @@ get_process_ttyname(char *name, size_t namelen)
 	    if (sudo_isatty(i, &sb)) {
 		ttydev = sb.st_rdev;
 		if (sudo_ttyname_dev(sb.st_rdev, name, namelen) == NULL) {
-		    sudo_warnx(
-			U_("unable to find terminal name for device %u, %u"),
+		    sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+			"unable to find terminal name for device %u, %u",
 			(unsigned int)major(ttydev), (unsigned int)minor(ttydev));
-		    ttydev = (dev_t)-1;
+		    if (namelen != 0)
+			*name = '\0';
 		}
 		goto done;
 	    }
@@ -324,7 +335,7 @@ get_process_ttyname(char *name, size_t namelen)
 done:
     if (fd != -1)
 	close(fd);
-    if (ttydev == (dev_t)-1)
+    if (ttydev == NODEV)
 	sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO|SUDO_DEBUG_ERRNO,
 	    "unable to resolve tty via %s", path);
 
@@ -332,13 +343,15 @@ done:
 }
 #elif defined(HAVE_PSTAT_GETPROC)
 /*
- * Store the name of the tty to which the process is attached in name.
- * Returns name on success and NULL on failure, setting errno.
+ * Look up terminal device that the process is attached to and
+ * fill in its name, if available.  Sets name to the empty string
+ * if the device number cannot be mapped to a device name.
+ * Returns the tty device number on success and -1 on failure, setting errno.
  */
 dev_t
 get_process_ttyname(char *name, size_t namelen)
 {
-    dev_t ttydev = (dev_t)-1;
+    dev_t ttydev = NODEV;
     int rc, serrno = errno;
     struct pst_status pst;
     debug_decl(get_process_ttyname, SUDO_DEBUG_UTIL);
@@ -354,11 +367,12 @@ get_process_ttyname(char *name, size_t namelen)
 	    errno = serrno;
 	    ttydev = makedev(pst.pst_term.psd_major, pst.pst_term.psd_minor);
 	    if (sudo_ttyname_dev(ttydev, name, namelen) == NULL) {
-		sudo_warnx(
-		    U_("unable to find terminal name for device %u, %u"),
+		sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+		    "unable to find terminal name for device %u, %u",
 		    (unsigned int)pst.pst_term.psd_major,
 		    (unsigned int)pst.pst_term.psd_minor);
-		ttydev = (dev_t)-1;
+		if (namelen != 0)
+		    *name = '\0';
 	    }
 	    goto done;
 	}
@@ -373,8 +387,8 @@ done:
 }
 #else
 /*
- * Store the name of the tty to which the process is attached in name.
- * Returns name on success and NULL on failure, setting errno.
+ * Look up terminal device that the process is attached to and fill in name.
+ * Returns the tty device number on success and -1 on failure, setting errno.
  */
 dev_t
 get_process_ttyname(char *name, size_t namelen)
@@ -404,6 +418,6 @@ get_process_ttyname(char *name, size_t namelen)
     sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO|SUDO_DEBUG_ERRNO,
 	"unable to resolve tty via ttyname");
     errno = ENOENT;
-    debug_return_dev_t((dev_t)-1);
+    debug_return_dev_t(NODEV);
 }
 #endif
