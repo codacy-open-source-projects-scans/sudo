@@ -627,7 +627,7 @@ handle_restart(const RestartMessage *msg, const uint8_t *buf, size_t len,
     }
 
     /* Check that message is valid. */
-    if (msg == NULL || msg->log_id[0] == '\0' || msg->resume_point == NULL) {
+    if (msg == NULL || msg->log_id[0] == '\0' || !valid_timespec(msg->resume_point)) {
 	sudo_warnx(U_("%s: %s"), source, U_("invalid RestartMessage"));
 	closure->errstr = _("invalid RestartMessage");
 	debug_return_bool(false);
@@ -711,11 +711,12 @@ handle_iobuf(int iofd, const IoBuffer *iobuf, const uint8_t *buf, size_t len,
     }
 
     /* Check that message is valid. */
-    if (iobuf == NULL || iobuf->delay == NULL || iobuf->data.len == 0) {
+    if (iobuf == NULL || iobuf->data.len == 0 || !valid_timespec(iobuf->delay)) {
 	sudo_warnx(U_("%s: %s"), source, U_("invalid IoBuffer"));
 	closure->errstr = _("invalid IoBuffer");
 	debug_return_bool(false);
     }
+
     sudo_debug_printf(SUDO_DEBUG_INFO, "%s: received IoBuffer from %s",
 	source, __func__);
 
@@ -758,7 +759,7 @@ handle_winsize(const ChangeWindowSize *msg, const uint8_t *buf, size_t len,
     }
 
     /* Check that message is valid. */
-    if (msg == NULL || msg->delay == NULL) {
+    if (msg == NULL || !valid_timespec(msg->delay)) {
 	sudo_warnx(U_("%s: %s"), source, U_("invalid ChangeWindowSize"));
 	closure->errstr = _("invalid ChangeWindowSize");
 	debug_return_bool(false);
@@ -794,11 +795,20 @@ handle_suspend(const CommandSuspend *msg, const uint8_t *buf, size_t len,
     }
 
     /* Check that message is valid. */
-    if (msg == NULL || msg->delay == NULL || msg->signal[0] == '\0') {
+    if (msg == NULL || !valid_timespec(msg->delay)) {
 	sudo_warnx(U_("%s: %s"), source, U_("invalid CommandSuspend"));
 	closure->errstr = _("invalid CommandSuspend");
 	debug_return_bool(false);
     }
+    if (strcmp(msg->signal, "STOP") != 0 && strcmp(msg->signal, "TSTP") != 0 && 
+	    strcmp(msg->signal, "CONT") != 0 &&
+	    strcmp(msg->signal, "TTIN") != 0 &&
+	    strcmp(msg->signal, "TTOU") != 0) {
+	sudo_warnx(U_("%s: %s"), source, U_("invalid CommandSuspend"));
+	closure->errstr = _("invalid CommandSuspend");
+	debug_return_bool(false);
+    }
+
     sudo_debug_printf(SUDO_DEBUG_INFO, "%s: received CommandSuspend from %s",
 	source, __func__);
 
@@ -1593,11 +1603,11 @@ bad:
 }
 
 static int
-create_listener(struct server_address *addr)
+open_listener_socket(struct server_address *addr)
 {
     int flags, on, sock;
     const char *family = "inet4";
-    debug_decl(create_listener, SUDO_DEBUG_UTIL);
+    debug_decl(open_listener_socket, SUDO_DEBUG_UTIL);
 
     if ((sock = socket(addr->sa_un.sa.sa_family, SOCK_STREAM, 0)) == -1) {
 	sudo_warn("socket");
@@ -1641,6 +1651,22 @@ bad:
 }
 
 static void
+free_listener(struct listener *l)
+{
+    debug_decl(free_listener, SUDO_DEBUG_UTIL);
+
+    if (l != NULL) {
+	sudo_ev_free(l->ev);
+	sudo_rcstr_delref(l->sa_str);
+	if (l->sock != -1)
+	    close(l->sock);
+	free(l);
+    }
+
+    debug_return;
+}
+
+static void
 listener_cb(int fd, int what, void *v)
 {
     struct listener *l = v;
@@ -1678,27 +1704,41 @@ listener_cb(int fd, int what, void *v)
 static bool
 register_listener(struct server_address *addr, struct sudo_event_base *evbase)
 {
-    struct listener *l;
+    struct listener *l = NULL;
     int sock;
     debug_decl(register_listener, SUDO_DEBUG_UTIL);
 
-    sock = create_listener(addr);
+    sock = open_listener_socket(addr);
     if (sock == -1)
-	debug_return_bool(false);
+	goto bad;
 
-    /* TODO: make non-fatal */
-    if ((l = malloc(sizeof(*l))) == NULL)
-	sudo_fatalx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
-    l->sock = sock;
-    l->tls = addr->tls;
+    if ((l = calloc(1, sizeof(*l))) == NULL) {
+	sudo_warnx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
+	goto bad;
+    }
     l->ev = sudo_ev_alloc(sock, SUDO_EV_READ|SUDO_EV_PERSIST, listener_cb, l);
-    if (l->ev == NULL)
-	sudo_fatalx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
-    if (sudo_ev_add(evbase, l->ev, NULL, false) == -1)
-	sudo_fatal("%s", U_("unable to add event to queue"));
+    if (l->ev == NULL) {
+	sudo_warnx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
+	goto bad;
+    }
+    l->sa_str = addr->sa_str;
+    sudo_rcstr_addref(l->sa_str);
+    l->sock = sock;
+    sock = -1;
+    l->tls = addr->tls;
+
+    if (sudo_ev_add(evbase, l->ev, NULL, false) == -1) {
+	sudo_warn("%s", U_("unable to add event to queue"));
+	goto bad;
+    }
     TAILQ_INSERT_TAIL(&listeners, l, entries);
 
     debug_return_bool(true);
+bad:
+    if (sock != -1)
+	close(sock);
+    free_listener(l);
+    debug_return_bool(false);
 }
 
 /*
@@ -1707,22 +1747,60 @@ register_listener(struct server_address *addr, struct sudo_event_base *evbase)
 static bool
 server_setup(struct sudo_event_base *base)
 {
+    struct listener_list kept_listeners =
+	TAILQ_HEAD_INITIALIZER(kept_listeners);
     struct server_address *addr;
     struct listener *l;
     int nlisteners = 0;
     bool ret;
     debug_decl(server_setup, SUDO_DEBUG_UTIL);
 
-    /* Free old listeners (if any) and register new ones. */
+    /*
+     * Free any listeners not present in the new config.
+     * We must free non-matching listeners before adding new ones.
+     */
     while ((l = TAILQ_FIRST(&listeners)) != NULL) {
 	TAILQ_REMOVE(&listeners, l, entries);
-	sudo_ev_free(l->ev);
-	close(l->sock);
-	free(l);
+
+	TAILQ_FOREACH(addr, logsrvd_conf_server_listen_address(), entries) {
+	    if (strcmp(addr->sa_str, l->sa_str) == 0) {
+		TAILQ_INSERT_TAIL(&kept_listeners, l, entries);
+		break;
+	    }
+	}
+	if (addr == NULL) {
+	    /* Listener not used in new config. */
+	    free_listener(l);
+	}
     }
+
+    /* Register new listeners, reusing existing ones. */
     TAILQ_FOREACH(addr, logsrvd_conf_server_listen_address(), entries) {
-	nlisteners += register_listener(addr, base);
+	/* Check for addr in kept_listeners first. */
+	TAILQ_FOREACH(l, &kept_listeners, entries) {
+	    if (strcmp(addr->sa_str, l->sa_str) == 0) {
+		/* Reuse existing listener. */
+		TAILQ_REMOVE(&kept_listeners, l, entries);
+		TAILQ_INSERT_TAIL(&listeners, l, entries);
+
+		/* Update l->sa_str from new addr. */
+		sudo_rcstr_delref(l->sa_str);
+		l->sa_str = addr->sa_str;
+		sudo_rcstr_addref(l->sa_str);
+
+		nlisteners++;
+		break;
+	    }
+	}
+
+	if (l == NULL) {
+	    /* Register new listener. */
+	    nlisteners += register_listener(addr, base);
+	}
     }
+    if (!TAILQ_EMPTY(&kept_listeners))
+	sudo_warnx("bug: kept_listeners not empty");
+
     ret = nlisteners > 0;
 
 #if defined(HAVE_OPENSSL)
@@ -2145,6 +2223,11 @@ main(int argc, char *argv[])
     if (!server_setup(evbase))
 	sudo_fatalx("%s", U_("unable to setup listen socket"));
 
+    if (!logsrvd_queue_scan(evbase)) {
+	/* Error displayed by logsrvd_queue_scan() */
+        return EXIT_FAILURE;
+    }
+
     register_signal(SIGHUP, evbase);
     register_signal(SIGINT, evbase);
     register_signal(SIGTERM, evbase);
@@ -2154,7 +2237,6 @@ main(int argc, char *argv[])
     daemonize(nofork);
     signal(SIGPIPE, SIG_IGN);
 
-    logsrvd_queue_scan(evbase);
     sudo_ev_dispatch(evbase);
     if (!nofork && logsrvd_conf_pid_file() != NULL)
 	unlink(logsrvd_conf_pid_file());

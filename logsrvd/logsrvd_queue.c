@@ -58,11 +58,14 @@
 
 #include <logsrvd.h>
 
-#if defined(HAVE_STRUCT_DIRENT_D_NAMLEN) && HAVE_STRUCT_DIRENT_D_NAMLEN
-# define NAMLEN(dirent) (dirent)->d_namlen
-#else
-# define NAMLEN(dirent) strlen((dirent)->d_name)
-#endif
+/*
+ * Queue of finished journal files to be relayed.
+ */
+struct outgoing_journal {
+    TAILQ_ENTRY(outgoing_journal) entries;
+    char *journal_path;
+};
+TAILQ_HEAD(outgoing_journal_queue, outgoing_journal);
 
 static struct outgoing_journal_queue outgoing_journal_queue =
     TAILQ_HEAD_INITIALIZER(outgoing_journal_queue);
@@ -215,7 +218,7 @@ logsrvd_queue_scan(struct sudo_event_base *evbase)
 
     dirlen = snprintf(path, sizeof(path), "%s/outgoing/%s",
 	logsrvd_conf_relay_dir(), uuid_template);
-    if (dirlen >= ssizeof(path)) {
+    if (dirlen < ssizeof(uuid_template) || dirlen >= ssizeof(path)) {
 	errno = ENAMETOOLONG;
 	sudo_warn("%s/outgoing/%s", logsrvd_conf_relay_dir(), uuid_template);
 	debug_return_bool(false);
