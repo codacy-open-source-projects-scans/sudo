@@ -262,7 +262,7 @@ sudo_dso_public int sudo_mmap_protect_v1(void *ptr);
 #define sudo_mmap_protect(_a) sudo_mmap_protect_v1(_a)
 
 /* multiarch.c */
-sudo_dso_public char *sudo_stat_multiarch_v1(const char * restrict path, struct stat * restrict sb);
+sudo_dso_public char *sudo_stat_multiarch_v1(const char *path, struct stat *sb);
 #define sudo_stat_multiarch(_a, _b) sudo_stat_multiarch_v1((_a), (_b))
 
 /* parseln.c */
@@ -306,7 +306,7 @@ sudo_dso_public int sudo_secure_open_file_v1(const char *path, uid_t uid, gid_t 
 #define sudo_secure_open_file(_a, _b, _c, _d, _e) sudo_secure_open_file_v1((_a), (_b), (_c), (_d), (_e))
 sudo_dso_public int sudo_secure_open_dir_v1(const char *path, uid_t uid, gid_t gid, struct stat *sb, int *error);
 #define sudo_secure_open_dir(_a, _b, _c, _d, _e) sudo_secure_open_dir_v1((_a), (_b), (_c), (_d), (_e))
-sudo_dso_public int sudo_open_conf_path_v1(const char *path, char *name, size_t namesize, int (*fn)(const char *, int));
+sudo_dso_public int sudo_open_conf_path_v1(const char *restrict path, char *restrict name, size_t namesize, int (*fn)(const char *, int));
 #define sudo_open_conf_path(_a, _b, _c, _d) sudo_open_conf_path_v1((_a), (_b), (_c), (_d))
 
 /* setgroups.c */
