@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: ISC
  *
- * Copyright (c) 1996, 1998-2005, 2007-2023
+ * Copyright (c) 1996, 1998-2005, 2007-2023, 2025
  *	Todd C. Miller <Todd.Miller@sudo.ws>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -304,7 +304,8 @@ main(int argc, char *argv[])
 	    while ((ch = getchar()) != EOF && ch != '\r' && ch != '\n')
 		    continue;
 	}
-	edit_sudoers(sp, editor, editor_argc, editor_argv, -1);
+	if (!edit_sudoers(sp, editor, editor_argc, editor_argv, -1))
+	    exitcode = 1;
     }
 
     /*
@@ -323,6 +324,9 @@ main(int argc, char *argv[])
 		exitcode = 1;
 	    }
 	}
+    } else {
+	/* Remove temporary files. */
+	visudo_cleanup();
     }
     free(editor);
 
@@ -474,7 +478,7 @@ static bool
 edit_sudoers(struct sudoersfile *sp, char *editor, int editor_argc,
     char **editor_argv, int lineno)
 {
-    int tfd;				/* sudoers temp file descriptor */
+    int tfd = -1;			/* sudoers temp file descriptor */
     bool modified;			/* was the file modified? */
     int ac;				/* argument count */
     char linestr[64];			/* string version of lineno */
@@ -485,18 +489,24 @@ edit_sudoers(struct sudoersfile *sp, char *editor, int editor_argc,
     bool ret = false;			/* return value */
     debug_decl(edit_sudoers, SUDOERS_DEBUG_UTIL);
 
-    if (fstat(sp->fd, &sb) == -1)
-	sudo_fatal(U_("unable to stat %s"), sp->opath);
+    if (fstat(sp->fd, &sb) == -1) {
+	sudo_warn(U_("unable to stat %s"), sp->opath);
+	goto done;
+    }
     orig_size = sb.st_size;
     mtim_get(&sb, orig_mtim);
 
     /* Create the temp file if needed and set timestamp. */
     if (sp->tpath == NULL) {
-	if (asprintf(&sp->tpath, "%s.tmp", sp->dpath) == -1)
-	    sudo_fatalx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
+	if (asprintf(&sp->tpath, "%s.tmp", sp->dpath) == -1) {
+	    sudo_warnx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
+	    goto done;
+	}
 	tfd = open(sp->tpath, O_WRONLY|O_CREAT|O_TRUNC, S_IRUSR|S_IWUSR);
-	if (tfd < 0)
-	    sudo_fatal("%s", sp->tpath);
+	if (tfd < 0) {
+	    sudo_warn("%s", sp->tpath);
+	    goto done;
+	}
 
 	/* Copy sp->opath -> sp->tpath and reset the mtime. */
 	if (orig_size != 0) {
@@ -505,19 +515,28 @@ edit_sudoers(struct sudoersfile *sp, char *editor, int editor_argc,
 
 	    (void) lseek(sp->fd, (off_t)0, SEEK_SET);
 	    while ((nread = read(sp->fd, buf, sizeof(buf))) > 0) {
-		if (write(tfd, buf, (size_t)nread) != nread)
-		    sudo_fatal("%s", U_("write error"));
+		if (write(tfd, buf, (size_t)nread) != nread) {
+		    sudo_warn("%s", U_("write error"));
+		    goto done;
+		}
 		lastch = buf[nread - 1];
+	    }
+	    if (nread == -1) {
+		sudo_warn(U_("%s: read error"), sp->opath);
+		goto done;
 	    }
 
 	    /* Add missing newline at EOF if needed. */
 	    if (lastch != '\n') {
 		lastch = '\n';
-		if (write(tfd, &lastch, 1) != 1)
-		    sudo_fatal("%s", U_("write error"));
+		if (write(tfd, &lastch, 1) != 1) {
+		    sudo_warn("%s", U_("write error"));
+		    goto done;
+		}
 	    }
 	}
 	(void) close(tfd);
+	tfd = -1;
     }
     times[0].tv_sec = times[1].tv_sec = orig_mtim.tv_sec;
     times[0].tv_nsec = times[1].tv_nsec = orig_mtim.tv_nsec;
@@ -610,6 +629,8 @@ edit_sudoers(struct sudoersfile *sp, char *editor, int editor_argc,
 
     ret = true;
 done:
+    if (tfd != -1)
+	close(tfd);
     debug_return_bool(ret);
 }
 
@@ -642,6 +663,7 @@ reparse_sudoers(struct sudoers_context *ctx, char *editor, int editor_argc,
 {
     struct sudoersfile *sp, *last;
     FILE *fp;
+    bool ret = false;
     int ch, oldlocale;
     debug_decl(reparse_sudoers, SUDOERS_DEBUG_UTIL);
 
@@ -652,13 +674,18 @@ reparse_sudoers(struct sudoers_context *ctx, char *editor, int editor_argc,
     while ((sp = TAILQ_FIRST(&sudoerslist)) != NULL) {
 	last = TAILQ_LAST(&sudoerslist, sudoersfile_list);
 	fp = fopen(sp->tpath, "r+");
-	if (fp == NULL)
-	    sudo_fatalx(U_("unable to re-open temporary file (%s), %s unchanged."),
+	if (fp == NULL) {
+	    sudo_warnx(U_("unable to re-open temporary file (%s), %s unchanged."),
 		sp->tpath, sp->opath);
+	    goto done;
+	}
 
 	/* Clean slate for each parse */
-	if (!init_defaults())
-	    sudo_fatalx("%s", U_("unable to initialize sudoers default values"));
+	if (!init_defaults()) {
+	    sudo_warnx("%s", U_("unable to initialize sudoers default values"));
+	    fclose(fp);
+	    goto done;
+	}
 	init_parser(ctx, sp->opath);
 	sp->errorline = -1;
 
@@ -687,15 +714,16 @@ reparse_sudoers(struct sudoers_context *ctx, char *editor, int editor_argc,
 		parse_error = false;	/* ignore parse error */
 		break;
 	    case 'x':
-		visudo_cleanup();	/* discard changes */
-		debug_return_bool(false);
+		goto done;		/* discard changes */
 	    case 'e':
 	    default:
 		/* Edit file with the parse error */
 		TAILQ_FOREACH(sp, &sudoerslist, entries) {
 		    if (errors == 0 || sp->errorline > 0) {
-			edit_sudoers(sp, editor, editor_argc, editor_argv,
-			    sp->errorline);
+			if (!edit_sudoers(sp, editor, editor_argc, editor_argv,
+				sp->errorline)) {
+			    goto done;
+			}
 		    }
 		}
 		break;
@@ -708,8 +736,9 @@ reparse_sudoers(struct sudoers_context *ctx, char *editor, int editor_argc,
 	    do {
 		printf(_("press return to edit %s: "), sp->opath);
 		while ((ch = getchar()) != EOF && ch != '\r' && ch != '\n')
-			continue;
-		edit_sudoers(sp, editor, editor_argc, editor_argv, -1);
+		    continue;
+		if (!edit_sudoers(sp, editor, editor_argc, editor_argv, -1))
+		    goto done;
 		if (sp->modified)
 		    modified = true;
 	    } while ((sp = TAILQ_NEXT(sp, entries)) != NULL);
@@ -723,8 +752,10 @@ reparse_sudoers(struct sudoers_context *ctx, char *editor, int editor_argc,
 	if (!parse_error)
 	    break;
     }
+    ret = true;
 
-    debug_return_bool(true);
+done:
+    debug_return_bool(ret);
 }
 
 /*
@@ -777,8 +808,10 @@ install_sudoers(struct sudoersfile *sp, bool set_owner, bool set_mode)
      */
     if (!set_owner || !set_mode) {
 	/* Preserve owner/perms of the existing file.  */
-	if (fstat(sp->fd, &sb) == -1)
-	    sudo_fatal(U_("unable to stat %s"), sp->opath);
+	if (fstat(sp->fd, &sb) == -1) {
+	    sudo_warn(U_("unable to stat %s"), sp->opath);
+	    goto done;
+	}
     }
     if (set_owner) {
 	if (chown(sp->tpath, sudoers_file_uid(), sudoers_file_gid()) != 0) {
@@ -911,8 +944,10 @@ run_command(const char *path, char *const *argv)
 
     switch (pid = sudo_debug_fork()) {
 	case -1:
-	    sudo_fatal(U_("unable to execute %s"), path);
+	    sudo_warn(U_("unable to execute %s"), path);
+	    debug_return_int(-1);
 	case 0:
+	    /* child */
 	    closefrom(STDERR_FILENO + 1);
 	    execv(path, argv);
 	    sudo_warn(U_("unable to run %s"), path);
