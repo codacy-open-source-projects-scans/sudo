@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: ISC
  *
- * Copyright (c) 2003-2023 Todd C. Miller <Todd.Miller@sudo.ws>
+ * Copyright (c) 2003-2023, 20255-2026 Todd C. Miller <Todd.Miller@sudo.ws>
  *
  * This code is derived from software contributed by Aaron Spangler.
  *
@@ -315,31 +315,34 @@ sudo_ldap_check_non_unix_group(struct sudoers_context *ctx,
     }
 
     /* walk through values */
-    for (p = bv; *p != NULL && !ret; p++) {
+    for (p = bv; *p != NULL; p++) {
 	bool negated = false;
+	int match = DENY;
 	const char *val = (*p)->bv_val;
 
 	if (*val == '!') {
 	    val++;
 	    negated = true;
 	}
-	if (*val == '+') {
-	    if (netgr_matches(nss, val,
+	if (val[0] == '+') {
+	    match = netgr_matches(nss, val,
 		def_netgroup_tuple ? ctx->runas.host : NULL,
-		def_netgroup_tuple ? ctx->runas.shost : NULL, pw->pw_name) == ALLOW)
-		ret = true;
+		def_netgroup_tuple ? ctx->runas.shost : NULL, pw->pw_name);
 	    DPRINTF2("ldap sudoUser netgroup '%s%s' ... %s",
-		negated ? "!" : "", val, ret ? "MATCH!" : "not");
-	} else {
+		negated ? "!" : "", val, match == ALLOW ? "MATCH!" : "not");
+	} else if (val[0] == '%' && val[1] == ':') {
 	    if (group_plugin_query(pw->pw_name, val + 2, pw))
-		ret = true;
+		match = ALLOW;
 	    DPRINTF2("ldap sudoUser non-Unix group '%s%s' ... %s",
-		negated ? "!" : "", val, ret ? "MATCH!" : "not");
+		negated ? "!" : "", val, match == ALLOW ? "MATCH!" : "not");
 	}
-	/* A negated match overrides all other entries. */
-	if (ret && negated) {
-	    ret = false;
-	    break;
+	if (match == ALLOW) {
+	    if (negated) {
+		/* A negated match overrides all other entries. */
+		ret = false;
+		break;
+	    }
+	    ret = true;
 	}
     }
 
@@ -799,7 +802,8 @@ done:
  * Builds up a filter to check against LDAP.
  */
 static char *
-sudo_ldap_build_pass1(struct sudoers_context *ctx, LDAP *ld, struct passwd *pw)
+sudo_ldap_build_pass1(struct sudoers_context *ctx, LDAP *ld, struct passwd *pw,
+    char **notbufp)
 {
     char idbuf[STRLEN_MAX_UNSIGNED(uid_t) + 1];
     char timebuffer[TIMEFILTER_LENGTH + 1];
@@ -829,7 +833,7 @@ sudo_ldap_build_pass1(struct sudoers_context *ctx, LDAP *ld, struct passwd *pw)
     }
 
     /* Add space for the global OR clause + (sudoUser=ALL) + NOT + NUL. */
-    sz += sizeof("(|(sudoUser=ALL)(!(|)))");
+    sz += sizeof("(|(sudoUser=ALL)(!(|(sudoUser=!ALL))))");
 
     /* Add space for username and uid, including the negated versions. */
     sz += ((sizeof("(sudoUser=)(sudoUser=#)") - 1 +
@@ -966,8 +970,9 @@ sudo_ldap_build_pass1(struct sudoers_context *ctx, LDAP *ld, struct passwd *pw)
 	free(ng);
     }
 
-    /* Add ALL to list. */
+    /* Add ALL to the list and close it. */
     CHECK_STRLCAT(buf, "(sudoUser=ALL))", sz);
+    CHECK_STRLCAT(notbuf, "(sudoUser=!ALL)", sz);
 
     /* Add filter for negated entries. */
     CHECK_STRLCAT(buf, "(!(|", sz);
@@ -993,7 +998,7 @@ out:
 	sudo_grlist_delref(grlist);
     if (grp != NULL)
 	sudo_gr_delref(grp);
-    free(notbuf);
+    *notbufp = notbuf;
     debug_return_str(buf);
 overflow:
     sudo_warnx(U_("internal error, %s overflow"), __func__);
@@ -1016,10 +1021,11 @@ bad:
 
 /*
  * Builds up a filter to check against non-Unix group
- * entries in LDAP, including netgroups.
+ * entries in LDAP, including netgroups.  We use the
+ * negative filter generated during the first pass.
  */
 static char *
-sudo_ldap_build_pass2(void)
+sudo_ldap_build_pass2(const char *filt_neg)
 {
     char *filt, timebuffer[TIMEFILTER_LENGTH + 1];
     bool query_netgroups = def_use_netgroups;
@@ -1053,19 +1059,20 @@ sudo_ldap_build_pass2(void)
      * Match all sudoUsers beginning with '+' or '%:'.
      * If a search filter or time restriction is specified,
      * those get ANDed in to the expression.
+     * We also use the negative filter generated in pass1.
      */
     if (query_netgroups && def_group_plugin) {
-	len = asprintf(&filt, "%s%s(|(sudoUser=+*)(sudoUser=!+*)(sudoUser=%%:*)(sudoUser=!%%:*))%s%s",
+	len = asprintf(&filt, "%s%s(|(sudoUser=+*)(sudoUser=!+*)(sudoUser=%%:*)(sudoUser=!%%:*))(!(|%s))%s%s",
 	    (ldap_conf.timed || ldap_conf.search_filter) ? "(&" : "",
 	    ldap_conf.search_filter ? ldap_conf.search_filter : "",
-	    ldap_conf.timed ? timebuffer : "",
+	    filt_neg, ldap_conf.timed ? timebuffer : "",
 	    (ldap_conf.timed || ldap_conf.search_filter) ? ")" : "");
     } else {
-	len = asprintf(&filt, "%s%s(|(sudoUser=%s*)(sudoUser=!%s*))%s%s",
+	len = asprintf(&filt, "%s%s(|(sudoUser=%s*)(sudoUser=!%s*))(!(|%s))%s%s",
 	    (ldap_conf.timed || ldap_conf.search_filter) ? "(&" : "",
 	    ldap_conf.search_filter ? ldap_conf.search_filter : "",
 	    query_netgroups ? "+" : "%:", query_netgroups ? "+" : "%:",
-	    ldap_conf.timed ? timebuffer : "",
+	    filt_neg, ldap_conf.timed ? timebuffer : "",
 	    (ldap_conf.timed || ldap_conf.search_filter) ? ")" : "");
     }
     if (len == -1)
@@ -1814,6 +1821,7 @@ sudo_ldap_result_get(struct sudoers_context *ctx, const struct sudo_nss *nss,
     LDAPMessage *entry, *result;
     LDAP *ld = handle->ld;
     char *filt = NULL;
+    char *filt_neg = NULL;
     int pass, rc;
     debug_decl(sudo_ldap_result_get, SUDOERS_DEBUG_LDAP);
 
@@ -1839,7 +1847,8 @@ sudo_ldap_result_get(struct sudoers_context *ctx, const struct sudo_nss *nss,
     if (lres == NULL)
 	goto oom;
     for (pass = 0; pass < 2; pass++) {
-	filt = pass ? sudo_ldap_build_pass2() : sudo_ldap_build_pass1(ctx, ld, pw);
+	filt = pass ? sudo_ldap_build_pass2(filt_neg) :
+	    sudo_ldap_build_pass1(ctx, ld, pw, &filt_neg);
 	if (filt != NULL) {
 	    DPRINTF1("ldap search '%s'", filt);
 	    STAILQ_FOREACH(base, &ldap_conf.base, entries) {
@@ -1899,6 +1908,7 @@ sudo_ldap_result_get(struct sudoers_context *ctx, const struct sudo_nss *nss,
 oom:
     sudo_warnx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
     free(filt);
+    free(filt_neg);
     sudo_ldap_result_free(lres);
     debug_return_ptr(NULL);
 }

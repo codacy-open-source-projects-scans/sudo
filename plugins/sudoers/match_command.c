@@ -418,7 +418,8 @@ command_matches_fnmatch(struct sudoers_context *ctx, const char *sudoers_cmnd,
      * We do not attempt to match a relative path unless there is a
      * canonicalized version.
      */
-    if (cmnd[0] != '/' || fnmatch(sudoers_cmnd, cmnd, FNM_PATHNAME) != 0) {
+    if (cmnd[0] != '/' || sudo_contains_dot_dot(cmnd) ||
+	    fnmatch(sudoers_cmnd, cmnd, FNM_PATHNAME) != 0) {
 	/* No match, retry using the canonicalized path (if possible). */
 	if (ctx->user.cmnd_dir == NULL)
 	    debug_return_int(DENY);
@@ -475,7 +476,8 @@ command_matches_regex(struct sudoers_context *ctx, const char *sudoers_cmnd,
      *
      * Neither sudoers_cmnd nor user_cmnd are relative to runchroot.
      */
-    if (cmnd[0] != '/' || regex_matches(sudoers_cmnd, cmnd) != ALLOW) {
+    if (cmnd[0] != '/' || sudo_contains_dot_dot(cmnd) ||
+	    regex_matches(sudoers_cmnd, cmnd) != ALLOW) {
 	/* No match, retry using the canonicalized path (if possible). */
 	if (ctx->user.cmnd_dir == NULL)
 	    debug_return_int(DENY);
