@@ -151,13 +151,6 @@ evlog_new(const TimeSpec *submit_time, InfoMessage * const *info_msgs,
        goto bad;
     }
 
-    /* Create a UUID to store in the event log. */
-    sudo_uuid_create(uuid);
-    if (sudo_uuid_to_string(uuid, evlog->uuid_str, sizeof(evlog->uuid_str)) == NULL) {
-       sudo_warnx("%s", U_("unable to generate UUID"));
-       goto bad;
-    }
-
     /* Client/peer IP address. */
     if ((evlog->peeraddr = strdup(closure->ipaddr)) == NULL) {
 	sudo_warnx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
@@ -795,7 +788,7 @@ iolog_copy(struct iolog_file *src, struct iolog_file *dst, off_t remainder,
     while (remainder > 0) {
 	const size_t toread = MIN((size_t)remainder, sizeof(buf));
 	nread = iolog_read(src, buf, toread, errstr);
-	if (nread == -1)
+	if (nread <= 0)
 	    debug_return_bool(false);
 	remainder -= nread;
 
@@ -865,7 +858,12 @@ iolog_rewrite(const struct timespec *target, struct connection_closure *closure)
 		    evlog->iolog_path, iolog_fd_to_name(timing.event));
 		goto done;
 	    }
-	    iolog_file_sizes[timing.event] += (off_t)timing.u.nbytes;
+	    if (iolog_file_sizes[timing.event] > OFF_T_MAX - (off_t)timing.u.nbytes) {
+		errno = EOVERFLOW;
+		sudo_warn("%s", evlog->iolog_path);
+		goto done;
+	    }
+	    iolog_file_sizes[timing.event] += timing.u.nbytes;
 	}
 
 	if (sudo_timespeccmp(&closure->elapsed_time, target, >=)) {

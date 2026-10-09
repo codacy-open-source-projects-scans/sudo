@@ -66,6 +66,11 @@
 #  define SECCOMP_RET_KILL_PROCESS SECCOMP_RET_KILL
 # endif
 
+/* PTRACE_O_EXITKILL was added in Linux 3.8. */
+# ifndef PTRACE_O_EXITKILL
+#  define PTRACE_O_EXITKILL 0
+# endif
+
 static int seccomp_trap_supported = -1;
 # ifdef HAVE_PROCESS_VM_READV
 static size_t page_size;
@@ -81,6 +86,16 @@ get_stack_pointer(struct sudo_ptrace_regs *regs)
 	return compat_reg_sp(regs->u.compat);
     } else {
 	return reg_sp(regs->u.native);
+    }
+}
+
+static inline int
+get_sc_retval(struct sudo_ptrace_regs *regs)
+{
+    if (regs->compat) {
+	return compat_reg_retval(regs->u.compat);
+    } else {
+	return reg_retval(regs->u.native);
     }
 }
 
@@ -224,6 +239,12 @@ static inline unsigned long
 get_stack_pointer(struct sudo_ptrace_regs *regs)
 {
     return reg_sp(regs->u.native);
+}
+
+static inline int
+get_sc_retval(struct sudo_ptrace_regs *regs)
+{
+    return reg_retval(regs->u.native);
 }
 
 static inline void
@@ -542,7 +563,7 @@ static ssize_t
 strtab_to_vec(char *strtab, size_t strtab_len, int *countp, char ***vecp,
     char **bufp, size_t *bufsizep, size_t remainder)
 {
-    char *strend = strtab + strtab_len;
+    const char *strend = strtab + strtab_len;
     char **vec, **vp;
     int count = 0;
     debug_decl(strtab_to_vec, SUDO_DEBUG_EXEC);
@@ -559,10 +580,19 @@ strtab_to_vec(char *strtab, size_t strtab_len, int *countp, char ***vecp,
     /* Fill in vector with the strings we read. */
     for (vp = vec; strtab < strend; ) {
 	while (remainder < 2 * sizeof(char *)) {
+	    /*
+	     * Recalculate strtab_len based on the amount of space left
+	     * in the table.  growbuf() will adjust strtab and remainder,
+	     * but we need to manually account for changes to the alignment
+	     * of strend when vec is reset.
+	     */
+	    strtab_len = (size_t)(strend - strtab);
+	    remainder += (size_t)((char *)vec - strend);
 	    if (!growbuf(bufp, bufsizep, &strtab, &remainder))
 		debug_return_ssize_t(-1);
 	    strend = strtab + strtab_len;
 	    vec = (char **)LONGALIGN(strend);
+	    remainder -= (size_t)((char *)vec - strend);
 	    vp = vec + count;
 	}
 	/* Store offset into buf (not a pointer) in case of realloc(). */
@@ -774,7 +804,7 @@ ptrace_write_string(pid_t pid, unsigned long addr, const char *str)
 		__func__, (int)pid, addr, (int)sizeof(u.buf), u.buf);
 	    debug_return_ssize_t(-1);
 	}
-	if ((u.word & 0xff) == 0) {
+	if (u.buf[sizeof(u.buf) - 1] == '\0') {
 	    /* If the last byte we wrote is a NUL we are done. */
 	    debug_return_ssize_t(str - str0 + 1);
 	}
@@ -807,7 +837,7 @@ ptrace_writev_vec(pid_t pid, struct sudo_ptrace_regs *regs, char **vec,
 	continue;
     local = reallocarray(NULL, len, sizeof(struct iovec));
     remote = reallocarray(NULL, len, sizeof(struct iovec));
-    j = regs->compat && (len & 1) != 0;	/* pad for final NULL in compat */
+    j = regs->compat && (len & 1) == 0;	/* pad for final NULL in compat */
     addrbuf = reallocarray(NULL, len + 1 + j, regs->wordsize);
     if (local == NULL || remote == NULL || addrbuf == NULL) {
 	sudo_warnx(U_("%s: %s"), __func__, U_("unable to allocate memory"));
@@ -1352,7 +1382,7 @@ exec_ptrace_seize(pid_t child, int intercept_fd)
 {
     const long ptrace_opts = PTRACE_O_TRACESECCOMP|PTRACE_O_TRACECLONE|
 			     PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK|
-			     PTRACE_O_TRACEEXEC;
+			     PTRACE_O_TRACEEXEC|PTRACE_O_EXITKILL;
     struct command_status cstat;
     int ret = true;
     debug_decl(exec_ptrace_seize, SUDO_DEBUG_EXEC);
@@ -1495,10 +1525,10 @@ script_matches(const char *script, const char *execpath, int argc,
 	/* Match interpreter. */
 	if (!pathname_matches(execpath, interp, true)) {
 	    /* It is possible for the interpreter to be a script too. */
-	    if (argc > 0 && strcmp(interp, argv[1]) == 0) {
+	    if (argc > 1 && strcmp(interp, argv[1]) == 0) {
 		/* Interpreter args must match for *this* interpreter. */
 		if (interp_args == NULL ||
-			(argc > 1 && strcmp(interp_args, argv[2]) == 0)) {
+			(argc > 2 && strcmp(interp_args, argv[2]) == 0)) {
 		    script = interp;
 		    argv++;
 		    argc--;
@@ -1511,7 +1541,7 @@ script_matches(const char *script, const char *execpath, int argc,
 		}
 	    }
 	}
-	if (argc > 0 && interp_args != NULL) {
+	if (argc > 1 && interp_args != NULL) {
 	    if (strcmp(interp_args, argv[1]) != 0) {
 		sudo_warnx(
 		    U_("interpreter argument , expected \"%s\", got \"%s\""),
@@ -1570,7 +1600,7 @@ proc_read_vec(pid_t pid, const char *name, int *countp, char ***vecp,
     close(fd);
 
     /* Trim off the extra NUL byte at the end of the string table. */
-    if (strtab - *bufp >= 2 && strtab[-1] == '\0' && strtab[-2] == '\0') {
+    if (strtab - (*bufp + off) >= 2 && strtab[-1] == '\0' && strtab[-2] == '\0') {
 	strtab--;
 	remainder++;
     }
@@ -1595,8 +1625,8 @@ execve_args_match(const char *pathname, int argc, char * const *argv,
     int envc, char * const *envp, bool do_stat,
     struct intercept_closure *closure)
 {
-    bool ret = true;
-    int i;
+    bool ret = false;
+    int i, run_argc, run_envc;
     debug_decl(execve_args_match, SUDO_DEBUG_EXEC);
 
     if (!pathname_matches(pathname, closure->command, do_stat)) {
@@ -1614,24 +1644,18 @@ execve_args_match(const char *pathname, int argc, char * const *argv,
 	sudo_warnx(
 	    U_("pathname mismatch, expected \"%s\", got \"%s\""),
 	    closure->command, pathname ? pathname : "(NULL)");
-	ret = false;
+	goto done;
     }
+
 check_argv:
+    for (run_argc = 0; closure->run_argv[run_argc] != NULL; run_argc++)
+	continue;
+    if (argc != run_argc) {
+	sudo_warnx(U_("%s mismatch, expected %d, got %d"), "argc",
+	    run_argc, argc);
+	goto done;
+    }
     for (i = 0; i < argc; i++) {
-	if (closure->run_argv[i] == NULL) {
-	    ret = false;
-	    sudo_warnx(
-		U_("%s[%d] mismatch, expected \"%s\", got \"%s\""),
-		"argv", i, "(NULL)", argv[i] ? argv[i] : "(NULL)");
-	    break;
-	}
-	if (argv[i] == NULL) {
-	    ret = false;
-	    sudo_warnx(
-		U_("%s[%d] mismatch, expected \"%s\", got \"%s\""),
-		"argv", i, closure->run_argv[i], "(NULL)");
-	    break;
-	}
 	if (strcmp(argv[i], closure->run_argv[i]) != 0) {
 	    if (i == 0) {
 		/* Special case for argv[0] which may contain the basename. */
@@ -1650,43 +1674,42 @@ check_argv:
 		    }
 		}
 	    }
-	    ret = false;
 	    sudo_warnx(
 		U_("%s[%d] mismatch, expected \"%s\", got \"%s\""),
 		"argv", i, closure->run_argv[i], argv[i]);
-	}
-    }
-    for (i = 0; i < envc; i++) {
-	if (closure->run_envp[i] == NULL) {
-	    ret = false;
-	    sudo_warnx(
-		U_("%s[%d] mismatch, expected \"%s\", got \"%s\""),
-		"envp", i, "(NULL)", envp[i] ? envp[i] : "(NULL)");
-	    break;
-	} else if (envp[i] == NULL) {
-	    ret = false;
-	    sudo_warnx(
-		U_("%s[%d] mismatch, expected \"%s\", got \"%s\""),
-		"envp", i, closure->run_envp[i], "(NULL)");
-	    break;
-	} else if (strcmp(envp[i], closure->run_envp[i]) != 0) {
-	    ret = false;
-	    sudo_warnx(
-		U_("%s[%d] mismatch, expected \"%s\", got \"%s\""),
-		"envp", i, closure->run_envp[i], envp[i]);
+	    goto done;
 	}
     }
 
+    for (run_envc = 0; closure->run_envp[run_envc] != NULL; run_envc++)
+	continue;
+    if (envc != run_envc) {
+	sudo_warnx(U_("%s mismatch, expected %d, got %d"), "envc",
+	    run_envc, envc);
+	goto done;
+    }
+    for (i = 0; i < envc; i++) {
+	if (strcmp(envp[i], closure->run_envp[i]) != 0) {
+	    sudo_warnx(
+		U_("%s[%d] mismatch, expected \"%s\", got \"%s\""),
+		"envp", i, closure->run_envp[i], envp[i]);
+	    goto done;
+	}
+    }
+
+    ret = true;		/* matched! */
+
+done:
     debug_return_bool(ret);
 }
 
 /*
- * Verify that the execve(2) argument we wrote match the contents of closure.
- * TODO: test execveat(2) too.
+ * Verify that the execve(2) or execveat(2) arguments we wrote match
+ * the contents of closure.
  * Returns true if they match, else false.
  */
 static bool
-verify_execve_args(pid_t pid, struct sudo_ptrace_regs *regs,
+verify_execve_args(pid_t pid, bool is_execveat, struct sudo_ptrace_regs *regs,
     struct intercept_closure *closure)
 {
     char *pathname, **argv, **envp, *buf;
@@ -1694,7 +1717,7 @@ verify_execve_args(pid_t pid, struct sudo_ptrace_regs *regs,
     bool ret = false;
     debug_decl(verify_execve_args, SUDO_DEBUG_EXEC);
 
-    buf = get_exec_info(pid, false, regs, &pathname, &argc, &argv,
+    buf = get_exec_info(pid, is_execveat, regs, &pathname, &argc, &argv,
 	&envc, &envp);
     if (buf != NULL) {
 	ret = execve_args_match(pathname, argc, argv, envc, envp, false, closure);
@@ -1706,7 +1729,7 @@ verify_execve_args(pid_t pid, struct sudo_ptrace_regs *regs,
 
 /*
  * Verify that the command executed matches the arguments we checked.
- * Returns true on success and false on error.
+ * Returns true on success (or execve failure) and false on error.
  */
 static bool
 ptrace_verify_post_exec(pid_t pid, struct sudo_ptrace_regs *regs,
@@ -1741,7 +1764,21 @@ ptrace_verify_post_exec(pid_t pid, struct sudo_ptrace_regs *regs,
 	goto done;
     }
     if (status >> 8 != (SIGTRAP | (PTRACE_EVENT_EXEC << 8))) {
-	sudo_warnx(U_("process %d unexpected status 0x%x"), (int)pid, status);
+	/* No PTRACE_EVENT_EXEC, did execve(2) fail? */
+	struct sudo_ptrace_regs newregs;
+	memset(&newregs, 0, sizeof(newregs));
+	if (!ptrace_getregs(pid, &newregs, regs->compat)) {
+	    sudo_warn(U_("unable to get registers for process %d"), (int)pid);
+	    goto done;
+	}
+	if (get_sc_retval(&newregs) != 0) {
+	    /* execve(2) failure, nothing to verify. */
+	    ret = true;
+	} else {
+	    /* should not happen */
+	    sudo_warnx(U_("process %d unexpected status 0x%x"), (int)pid,
+		status);
+	}
 	goto done;
     }
 
@@ -2064,7 +2101,7 @@ ptrace_intercept_execve(pid_t pid, struct intercept_closure *closure)
 
 	    if (closure->state == POLICY_TEST) {
 		/* Verify the contents of what we just wrote. */
-		if (!verify_execve_args(pid, &regs, closure)) {
+		if (!verify_execve_args(pid, is_execveat, &regs, closure)) {
 		    sudo_debug_printf(SUDO_DEBUG_ERROR,
 			"%s: new execve args don't match closure", __func__);
 		}

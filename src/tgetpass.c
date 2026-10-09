@@ -131,7 +131,10 @@ restart:
 	/* If no tty present and we need to disable echo, try askpass. */
 	ttyfd = open(_PATH_TTY, O_RDWR);
 	if (ttyfd == -1 && !ISSET(flags, TGP_ECHO|TGP_NOECHO_TRY)) {
-	    if (askpass == NULL || getenv_unhooked("DISPLAY") == NULL) {
+	    if (askpass == NULL ||
+	        (getenv_unhooked("DISPLAY") == NULL &&
+	         getenv_unhooked("WAYLAND_DISPLAY") == NULL &&
+	         getenv_unhooked("WAYLAND_SOCKET") == NULL)) {
 		if (getenv_unhooked("SSH_CONNECTION") != NULL && getenv_unhooked("SSH_TTY") == NULL) {
 		    sudo_warnx("%s",
 			U_("a terminal is required to read the password; either use ssh's -t option or configure an askpass helper"));
@@ -400,6 +403,7 @@ static char *
 getln(int fd, char *buf, size_t bufsiz, bool cbreak, bool feedback,
     enum tgetpass_errval *errval)
 {
+    const char eraseline[3] = "\033[K";
     ssize_t nr = -1;
     const char *ep;
     char *cp = buf;
@@ -432,12 +436,20 @@ getln(int fd, char *buf, size_t bufsiz, bool cbreak, bool feedback,
 		    cp -= last_chunk_len(buf, cp - buf);
 		}
 		cp = buf;
+		if (feedback) {
+		    /* ANSI escape sequence to erase from cursor to EOL. */
+		    ignore_result(write(fd, eraseline, sizeof(eraseline)));
+		}
 		continue;
 	    } else if (c == sudo_term_erase) {
 		if (cp > buf) {
 		    if (feedback)
 			ignore_result(write(fd, "\b \b", 3));
 		    cp -= last_chunk_len(buf, cp - buf);
+		}
+		if (feedback) {
+		    /* ANSI escape sequence to erase from cursor to EOL. */
+		    ignore_result(write(fd, eraseline, sizeof(eraseline)));
 		}
 		continue;
 	    }

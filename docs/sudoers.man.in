@@ -2,7 +2,7 @@
 .\"
 .\" SPDX-License-Identifier: ISC
 .\"
-.\" Copyright (c) 1994-1996, 1998-2005, 2007-2025
+.\" Copyright (c) 1994-1996, 1998-2005, 2007-2026
 .\"	Todd C. Miller <Todd.Miller@sudo.ws>
 .\"
 .\" Permission to use, copy, modify, and distribute this software for any
@@ -26,7 +26,7 @@
 .nr BA @BAMAN@
 .nr LC @LCMAN@
 .nr PS @PSMAN@
-.TH "SUDOERS" "@mansectform@" "October 25, 2025" "Sudo @PACKAGE_VERSION@" "File Formats Manual"
+.TH "SUDOERS" "@mansectform@" "August 31, 2026" "Sudo @PACKAGE_VERSION@" "File Formats Manual"
 .nh
 .if n .ad l
 .SH "NAME"
@@ -796,7 +796,7 @@ User_Alias_Spec ::= User_Alias '=' User_List
 
 Runas_Alias ::= NAME
 
-Runas_Alias_Spec ::= Runas_Alias '=' Runas_List
+Runas_Alias_Spec ::= Runas_Alias '=' Runas_User_List
 
 Host_Alias ::= NAME
 
@@ -951,23 +951,32 @@ characters that need to be escaped.
 .nf
 .sp
 .RS 0n
-Runas_List ::= Runas_Member |
-               Runas_Member ',' Runas_List
+Runas_User_List ::= Runas_User |
+                    Runas_User ',' Runas_User_List
 
-Runas_Member ::= '!'* user name |
-                 '!'* #user-ID |
-                 '!'* %group |
-                 '!'* %#group-ID |
-                 '!'* %:nonunix_group |
-                 '!'* %:#nonunix_gid |
-                 '!'* +netgroup |
-                 '!'* Runas_Alias |
-                 '!'* ALL
+Runas_User ::= '!'* user name |
+               '!'* #user-ID |
+               '!'* %group |
+               '!'* %#group-ID |
+               '!'* %:nonunix_group |
+               '!'* %:#nonunix_gid |
+               '!'* +netgroup |
+               '!'* Runas_Alias |
+               '!'* ALL
+
+Runas_Group_List ::= Runas_Group |
+                     Runas_Group ',' Runas_Group_List
+
+Runas_Group ::= '!'* group name |
+                '!'* #group-ID |
+                '!'* +netgroup |
+                '!'* Runas_Alias |
+                '!'* ALL
 .RE
 .fi
 .PP
 A
-\fIRunas_List\fR
+\fIRunas_User_List\fR
 is similar to a
 \fIUser_List\fR
 except that instead
@@ -984,7 +993,9 @@ and
 \fBtoor\fR),
 you can use a user-ID instead of a name (#0 in the example given).
 The user-ID or group-ID specified in a
-\fIRunas_Member\fR
+\fIRunas_User\fR
+or
+\fIRunas_Group\fR
 need not be listed in the password or group database.
 .nf
 .sp
@@ -1253,6 +1264,11 @@ See the description of the
 setting for more information on how
 \fBsudo\fR
 executes commands that have an associated digest.
+This setting has no effect for the
+\fBlist\fR
+and
+\fBsudoedit\fR
+built-in commands.
 .PP
 Command digests are only supported by version 1.8.7 or higher.
 .SS "Defaults"
@@ -1298,7 +1314,7 @@ Default_Type ::= 'Defaults' |
                  'Defaults@' Host_List |
                  'Defaults:' User_List |
                  'Defaults!' Cmnd_List |
-                 'Defaults>' Runas_List
+                 'Defaults>' Runas_User_List
 
 Default_Entry ::= Default_Type Parameter_List
 
@@ -1385,7 +1401,7 @@ Cmnd_Spec_List ::= Cmnd_Spec |
 
 Cmnd_Spec ::= Runas_Spec? Option_Spec* (Tag_Spec ':')* Cmnd
 
-Runas_Spec ::= '(' Runas_List? (':' Runas_List)? ')'
+Runas_Spec ::= '(' Runas_User_List? (':' Runas_Group_List)? ')'
 
 .ie \n(SL \{\
 .ie \n(PS Option_Spec ::= (SELinux_Spec | Solaris_Priv_Spec | Date_Spec | Timeout_Spec | Chdir_Spec | Chroot_Spec)
@@ -1451,34 +1467,33 @@ determines the user and/or the group that a command
 may be run as.
 A fully-specified
 \fIRunas_Spec\fR
-consists of two
-\fIRunas_List\fRs
+consists of a
+\fIRunas_User_List\fR
+and a
+\fIRunas_Group_List\fR
 (as defined above) separated by a colon
 (\(oq\&:\(cq)
 and enclosed in a set of parentheses.
-The first
-\fIRunas_List\fR
+The first list
+(\fIRunas_User_List\fR)
 indicates which users the command may be run as via the
 \fB\-u\fR
 option.
-The second defines a list of groups that may be specified via the
+The second list
+(\fIRunas_Group_List\fR)
+defines a list of groups that may be specified via the
 \fB\-g\fR
 option (in addition to any of the target user's groups).
-If both
-\fIRunas_List\fRs
+If both lists
 are specified, the command may be run with any combination of users
-and groups listed in their respective
-\fIRunas_List\fRs.
+and groups listed in their respective lists.
 If only the first is specified, the command may be run as any user
 in the list and, optionally, with any group the target user belongs to.
-If the first
-\fIRunas_List\fR
-is empty but the
+If the first list is empty but the
 second is specified, the command may be run as the invoking user
 with the group set to any listed in the
-\fIRunas_List\fR.
-If both
-\fIRunas_List\fRs
+\fIRunas_Group_List\fR.
+If both lists
 are empty, the command may only be run as the invoking user and the
 group, if specified, must be one that the invoking user is a member of.
 If no
@@ -1865,6 +1880,11 @@ Path names of the form
 are interpreted as being relative to the named user's home directory.
 If the user name is omitted, the path will be relative to the runas
 user's home directory.
+This setting has no effect for the
+\fBlist\fR
+and
+\fBsudoedit\fR
+built-in commands.
 .PP
 This setting is only supported by version 1.9.3 or higher.
 .SS "Chroot_Spec"
@@ -1902,6 +1922,11 @@ Path names of the form
 are interpreted as being relative to the named user's home directory.
 If the user name is omitted, the path will be relative to the runas
 user's home directory.
+This setting has no effect for the
+\fBlist\fR
+and
+\fBsudoedit\fR
+built-in commands.
 .PP
 This setting is only supported by version 1.9.3 or higher.
 .SS "Tag_Spec"
@@ -2375,6 +2400,36 @@ files only.
 bob    ALL = sudoedit ^/etc/(motd|issue|hosts)$
 .RE
 .fi
+.PP
+\fBRegular expressions in sudoedit rules should be used with care.\fR
+.br
+Unlike wildcards, a forward slash
+(\(oq/\(cq)
+in a regular expression is not treated specially and will match as
+a normal character.
+The arguments to
+\fBsudoedit\fR
+are concatenated together, separated by a space character, and are
+matched as a single string, even when the user specifies multiple
+files to edit.
+As a result, a pattern that matches any character will also match
+white space, potentially allowing a user to edit any file on the system.
+In general, regular expressions that match any character are unsafe in a
+\fBsudoedit\fR
+rule and should be avoided.
+For example, the following rule is overly broad and would allow user bob
+to edit any file as long as the arguments to
+\fBsudoers\fR
+sudoedit
+begin with a file located in
+\fI/etc\fR.
+.nf
+.sp
+.RS 4n
+bob    ALL = sudoedit ^/etc/.*$
+.RE
+.fi
+.sp
 .PP
 Regular expressions may also be used to match the command itself.
 In this example, a regular expression is used to allow user
@@ -7604,11 +7659,6 @@ system call instead of pre-loading a dynamic shared object.
 Both static and dynamic executables are supported and it is compatible with
 \fBsudo\fR's
 SELinux RBAC mode.
-Functions utilizing the
-execveat(2)
-system call, such as
-fexecve(3),
-are not currently intercepted.
 Programs that rely on
 ptrace(2)
 themselves, such as debuggers and system call tracers

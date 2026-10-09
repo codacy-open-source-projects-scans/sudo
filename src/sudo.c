@@ -128,8 +128,10 @@ static void approval_show_version(int verbose);
 sudo_dso_public int main(int argc, char *argv[], char *envp[]);
 
 static struct sudo_settings *sudo_settings;
-static char * const *user_info, * const *submit_argv, * const *submit_envp;
-static int submit_optind;
+static char * const *user_info;
+static char * const *submit_argv;	/* argv[] from main() */
+static char **submit_envp;		/* shallow copy of envp[] from main() */
+static int submit_optind;		/* optind from after getopt() */
 
 int
 main(int argc, char *argv[], char *envp[])
@@ -200,9 +202,8 @@ main(int argc, char *argv[], char *envp[])
     if (sudo_conf_disable_coredump())
 	disable_coredump();
 
-    /* Parse command line arguments, preserving the original argv/envp. */
+    /* Parse command line arguments, preserving the original argv. */
     submit_argv = argv;
-    submit_envp = envp;
     sudo_mode = parse_args(argc, argv, user_details.shell, &submit_optind,
 	&nargc, &nargv, &sudo_settings, &env_add, &list_user);
     sudo_debug_printf(SUDO_DEBUG_DEBUG, "sudo_mode 0x%x", sudo_mode);
@@ -339,30 +340,50 @@ access_denied:
 }
 
 /*
- * Set the time zone using tzset(3), ignoring the user's TZ
+ * Set the time zone using tzset(3), removing the user's TZ
  * environment variable.  The original value of TZ may still
  * be present in the command's environment, depending on sudoers.
  */
 static void
 set_time_zone(void)
 {
-    extern char **environ;
-    char **real_environ = environ;
-    char *empty[] = { NULL };
-
     /* Use system time zone, not user-specified. */
-    environ = empty;
+    unsetenv("TZ");
     (void) tzset();
-    environ = real_environ;
 }
 
+/*
+ * Initialize garbage collection, load symbols for static sudoers,
+ * and make a shallow copy of envp[] for the plugins to use.
+ * Called via os_init().
+ */
 int
 os_init_common(int argc, char *argv[], char *envp[])
 {
+    unsigned int envc;
 #ifdef STATIC_SUDOERS_PLUGIN
     preload_static_symbols();
 #endif
     gc_init();
+
+    /*
+     * Make a shallow copy of envp[] and store in submit_envp[].
+     * This allows us to remove variables from sudo's environment
+     * while still providing the original envp to the plugins.
+     */
+    for (envc = 0; envp[envc] != NULL; envc++)
+	continue;
+    if (envc != 0) {
+	submit_envp = reallocarray(NULL, sizeof(char *), envc + 1);
+	if (submit_envp == NULL || !gc_add(GC_PTR, submit_envp)) {
+	    sudo_fatalx_nodebug(U_("%s: %s"), __func__,
+		U_("unable to allocate memory"));
+	}
+	for (envc = 0; envp[envc] != NULL; envc++)
+	    submit_envp[envc] = envp[envc];
+	submit_envp[envc] = NULL;
+    }
+
     return 0;
 }
 

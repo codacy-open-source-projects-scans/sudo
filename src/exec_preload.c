@@ -18,6 +18,7 @@
 
 #include <config.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -161,6 +162,7 @@ oflow:
     va_end(ap);
     free_fn(newstr);
     sudo_warnx(U_("internal error, %s overflow"), __func__);
+    errno = EOVERFLOW;
     debug_return_str(NULL);
 }
 

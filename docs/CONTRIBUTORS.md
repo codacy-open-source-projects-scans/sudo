@@ -188,6 +188,7 @@ The following people have worked to translate sudo into
 other languages as part of the Translation Project, see
 https://translationproject.org for more details.
 
+    Al-Saidi, Zayed
     Albuquerque, Pedro
     Blättermann, Mario
     Bogusz, Jakub
@@ -225,6 +226,7 @@ https://translationproject.org for more details.
     Nylander, Daniel
     Pan, Yi-Jyun
     Písař, Petr
+    Prieditis, Rihards
     Puente, Enol
     Putanec, Božidar
     Quân, Trần Ngọc
