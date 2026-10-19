@@ -1151,7 +1151,7 @@ write_output(int fd, int what, void *v)
 	    iobuf->lastc = (size_t)nwritten == nbytes ? '\n' : '\r';
 	} else {
 	    /* Stash the last char written. */
-	    iobuf->lastc = *((char *)iov[0].iov_base + nwritten);
+	    iobuf->lastc = *((char *)iov[0].iov_base + nwritten - 1);
 	}
 	if (added_cr) {
 	    /* Subtract one for the carriage return we added above. */
@@ -1162,6 +1162,17 @@ write_output(int fd, int what, void *v)
     }
 
     if (iobuf->off == iobuf->len) {
+	if (iobuf->toread != 0) {
+	    /*
+	     * Record is larger than the I/O buffer, reset the buffer and
+	     * reschedule to write the rest of the record before advancing.
+	     */
+	    iobuf->off = 0;
+	    iobuf->len = 0;
+	    if (sudo_ev_add(NULL, closure->output_ev, NULL, false) == -1)
+		sudo_fatal("%s", U_("unable to add event to queue"));
+	    debug_return;
+	}
 	/* Write complete, go to next timing entry if possible. */
 	switch (get_timing_record(closure)) {
 	case 0:

@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <pwd.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #ifdef HAVE_PAM_PAM_APPL_H
 # include <pam/pam_appl.h>
@@ -56,6 +57,7 @@
 #endif
 
 #include <sudoers.h>
+#include <sudo_compat.h>
 #include "sudo_auth.h"
 
 /* Only OpenPAM and Linux PAM use const qualifiers. */
@@ -74,6 +76,10 @@
 
 #ifndef PAM_DATA_SILENT
 #define PAM_DATA_SILENT	0
+#endif
+
+#ifndef PAM_BAD_ITEM
+#define PAM_BAD_ITEM	PAM_SYMBOL_ERR
 #endif
 
 struct sudo_pam_closure {
@@ -95,6 +101,55 @@ static bool getpass_error;
 static bool noninteractive;
 static pam_handle_t *pamh;
 static struct conv_filter *conv_filter;
+
+/* Whether terminal echo was disabled during authentication (see below). */
+static bool pam_echo_disabled;
+
+/*
+ * Disable terminal echo during PAM authentication.
+ *
+ * After tgetpass() reads the password it restores the terminal to its
+ * original state, which re-enables echo.  If the PAM stack then sleeps
+ * (for example, the fail delay applied by pam_unix(8) after an incorrect
+ * password) any input typed by the user during that time would be echoed
+ * to the terminal in the clear.  Disabling echo once the password has been
+ * read ensures a password typed ahead during the delay is not revealed.
+ */
+static void
+pam_disable_echo(void)
+{
+    int fd;
+    debug_decl(pam_disable_echo, SUDOERS_DEBUG_AUTH);
+
+    fd = open(_PATH_TTY, O_RDWR);
+    if (fd != -1) {
+	if (sudo_term_noecho(fd))
+	    pam_echo_disabled = true;
+	(void) close(fd);
+    }
+    debug_return;
+}
+
+/*
+ * Restore the terminal settings saved by pam_disable_echo(), re-enabling
+ * echo and flushing any input typed while echo was disabled.
+ */
+static void
+pam_restore_echo(void)
+{
+    int fd;
+    debug_decl(pam_restore_echo, SUDOERS_DEBUG_AUTH);
+
+    if (pam_echo_disabled) {
+	fd = open(_PATH_TTY, O_RDWR);
+	if (fd != -1) {
+	    (void) sudo_term_restore(fd, true);
+	    (void) close(fd);
+	}
+	pam_echo_disabled = false;
+    }
+    debug_return;
+}
 
 static void
 conv_filter_init(const struct sudoers_context *ctx)
@@ -313,11 +368,57 @@ sudo_pam_verify(const struct sudoers_context *ctx, struct passwd *pw,
 	}
     }
 
+    /*
+     * Clear SUDO_PROMPT before authentication to avoid stale values
+     * from previous PAM transactions.
+     */
+    rc = pam_putenv(pamh, "SUDO_PROMPT");
+    if (rc != PAM_SUCCESS && rc != PAM_BAD_ITEM) {
+        const char *errstr = sudo_pam_strerror(pamh, rc);
+        sudo_debug_printf(SUDO_DEBUG_ERROR|SUDO_DEBUG_LINENO,
+                          "pam_putenv(pamh, SUDO_PROMPT): %s", errstr);
+        debug_return_int(AUTH_ERROR);
+    }
+
+    if (ctx->user.prompt || def_passprompt_override) {
+        char *sudo_prompt = NULL;
+
+        if (asprintf(&sudo_prompt, "SUDO_PROMPT=%s", def_prompt) != -1) {
+            rc = pam_putenv(pamh, sudo_prompt);
+            free(sudo_prompt);
+
+            if (rc != PAM_SUCCESS) {
+                const char *errstr = sudo_pam_strerror(pamh, rc);
+                sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+                                  "pam_putenv(pamh, SUDO_PROMPT, %s): %s",
+                                  def_prompt, errstr);
+            }
+        } else {
+            const char *errstr = strerror(errno);
+            sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+                              "unable to set SUDO_PROMPT: %s", errstr);
+        }
+    }
+
     /* PAM_SILENT prevents the authentication service from generating output. */
     *pam_status = pam_authenticate(pamh, def_pam_silent ? PAM_SILENT : 0);
 
+    /*
+     * Re-enable terminal echo, which may have been disabled by converse()
+     * so that input typed during the PAM fail delay was not echoed.
+     */
+    pam_restore_echo();
+
     /* Restore def_prompt, the passed-in prompt may be freed later. */
     def_prompt = PASSPROMPT;
+
+    /* Clear the SUDO_PROMPT PAM environment variable. */
+    rc = pam_putenv(pamh, "SUDO_PROMPT");
+    if (rc != PAM_SUCCESS) {
+        const char *errstr = sudo_pam_strerror(pamh, rc);
+        sudo_debug_printf(SUDO_DEBUG_WARN|SUDO_DEBUG_LINENO,
+                          "pam_putenv(pamh, SUDO_PROMPT): %s", errstr);
+    }
 
     /* Restore KRB5CCNAME to its original value. */
     if (envccname == NULL && sudo_unsetenv("KRB5CCNAME") != 0) {
@@ -434,6 +535,12 @@ sudo_pam_cleanup(const struct sudoers_context *ctx, struct passwd *pw,
 {
     int *pam_status = (int *) auth->data;
     debug_decl(sudo_pam_cleanup, SUDOERS_DEBUG_AUTH);
+
+    /*
+     * Make sure terminal echo is restored in case converse() disabled it
+     * (e.g. during pam_chauthtok()) and it was not restored elsewhere.
+     */
+    pam_restore_echo();
 
     /* If successful, we can't close the session until sudo_pam_end_session() */
     if (force || *pam_status != PAM_SUCCESS || auth->end_session == NULL) {
@@ -744,6 +851,15 @@ converse(int num_msg, PAM_CONST struct pam_message **msg,
 		goto bad;
 	    }
 	    reply[n].resp = pass;	/* auth_getpass() malloc's a copy */
+
+	    /*
+	     * Disable terminal echo so that a password typed ahead while
+	     * the PAM stack sleeps (e.g. the fail delay after a bad
+	     * password) is not echoed in the clear.  Echo is restored
+	     * once pam_authenticate() returns (see sudo_pam_verify()).
+	     */
+	    if (type == SUDO_CONV_PROMPT_ECHO_OFF)
+		pam_disable_echo();
 	    break;
 	case PAM_TEXT_INFO:
 	    if (pm->msg != NULL && !is_filtered(pm->msg))
